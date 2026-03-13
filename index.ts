@@ -1,441 +1,242 @@
-import { createClient as _createClient } from "https://esm.sh/@supabase/supabase-js@2.49.4";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.4";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+const HF_API_URL = "https://router.huggingface.co/v1/chat/completions";
+const HF_MODEL = "mistralai/Mistral-7B-Instruct-v0.3";
 
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+const BASE_SYSTEM_PROMPT = `You are Jinny, a Personal AI Travel Proxy Agent for Roamie. You act as the traveler's intelligent travel representative — negotiating, planning, optimizing, and protecting their interests.
+
+## Your Core Capabilities:
+
+### 1. Auto-Negotiate Itinerary
+When multiple travelers are on a group trip, represent THIS traveler's preferences. Suggest compromises that respect their interests (food preferences, budget limits, activity types, pace).
+
+### 2. Personal Travel Concierge
+You know this traveler's history, preferences, and personality. Give personalized suggestions — not generic ones. Reference their past trips, preferred cuisines, budget habits, and travel style.
+
+### 3. Real-Time Trip Assistant
+Monitor and advise on weather changes, flight delays, local events, and safety alerts. Proactively suggest itinerary adjustments when disruptions occur.
+
+### 4. Budget Optimizer
+Track spending against budget. Suggest cost-saving swaps, alert when overspending, and recommend budget reallocation across activities.
+
+## Behavior Rules:
+- Always speak in the traveler's language (detect from their messages)
+- Be proactive — don't just answer, anticipate needs
+- When creating trips, respond with JSON in \`\`\`json ... \`\`\` blocks:
+{
+  "action": "create_trip",
+  "name": "Trip name",
+  "destination": "City",
+  "country": "Country",
+  "days": 5,
+  "budget": 50000,
+  "trip_type": "solo|group|random"
 }
-
-function errorResponse(message: string, status = 500): Response {
-  return jsonResponse({ error: message }, status);
+- For itinerary generation, use:
+{
+  "action": "generate_itinerary",
+  "trip_id": "uuid",
+  "activities": [{"name":"...", "time":"...", "cost": 0, "category":"..."}]
 }
-
-type Coord = [number, number]; // [lon, lat]
-
-interface WaypointParam {
-  lat: number;
-  lon: number;
+- For budget alerts, use:
+{
+  "action": "budget_alert",
+  "message": "...",
+  "spent": 0,
+  "remaining": 0,
+  "suggestions": ["..."]
 }
-
-// ─── main handler ─────────────────────────────────────────────────────────────
+- Use emojis sparingly. Be concise, warm, and actionable.`;
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
-  if (req.method !== "POST") {
-    return errorResponse("Method not allowed", 405);
-  }
-
   try {
-    const ORS_API_KEY = Deno.env.get("ORS_API_KEY");
-    if (!ORS_API_KEY) {
-      return errorResponse("ORS_API_KEY is not configured", 500);
-    }
-
-    // Parse request body
-    const body = await req.json().catch(() => null);
-    if (!body || typeof body.action !== "string") {
-      return errorResponse("Request body must include an 'action' field", 400);
-    }
-
-    const { action, ...params } = body as {
-      action: string;
-      [key: string]: unknown;
-    };
-    const baseUrl = "https://api.openrouteservice.org";
-
-    // Common ORS auth headers
-    const orsHeaders = {
-      Authorization: ORS_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    };
-
-    let url: string;
-    let fetchOptions: RequestInit = {};
-
-    // ── action router ─────────────────────────────────────────────────────────
-
-    switch (action) {
-      // ── Directions (JSON) ─────────────────────────────────────────────────
-      case "directions": {
-        const {
-          origin,
-          destination,
-          profile = "driving-car",
-          alternatives = false,
-          waypoints = [],
-        } = params as {
-          origin: WaypointParam;
-          destination: WaypointParam;
-          profile?: string;
-          alternatives?: boolean;
-          waypoints?: WaypointParam[];
-        };
-
-        if (!origin || !destination) {
-          return errorResponse("origin and destination are required", 400);
-        }
-
-        const coordinates: Coord[] = [
-          [origin.lon, origin.lat],
-          ...waypoints.map((w) => [w.lon, w.lat] as Coord),
-          [destination.lon, destination.lat],
-        ];
-
-        url = `${baseUrl}/v2/directions/${profile}/json`;
-        fetchOptions = {
-          method: "POST",
-          headers: orsHeaders,
-          body: JSON.stringify({
-            coordinates,
-            alternative_routes: alternatives
-              ? { target_count: 3, weight_factor: 1.6, share_factor: 0.6 }
-              : undefined,
-            instructions: true,
-            instructions_format: "text",
-            language: "en",
-            units: "km",
-            geometry: true,
-            elevation: false,
-          }),
-        };
-        break;
-      }
-
-      // ── Directions (GeoJSON) ──────────────────────────────────────────────
-      case "directions-geojson": {
-        const {
-          origin,
-          destination,
-          profile = "driving-car",
-          waypoints = [],
-        } = params as {
-          origin: WaypointParam;
-          destination: WaypointParam;
-          profile?: string;
-          waypoints?: WaypointParam[];
-        };
-
-        if (!origin || !destination) {
-          return errorResponse("origin and destination are required", 400);
-        }
-
-        const coordinates: Coord[] = [
-          [origin.lon, origin.lat],
-          ...waypoints.map((w) => [w.lon, w.lat] as Coord),
-          [destination.lon, destination.lat],
-        ];
-
-        url = `${baseUrl}/v2/directions/${profile}/geojson`;
-        fetchOptions = {
-          method: "POST",
-          headers: {
-            ...orsHeaders,
-            Accept: "application/json, application/geo+json",
-          },
-          body: JSON.stringify({
-            coordinates,
-            instructions: true,
-            language: "en",
-            units: "km",
-          }),
-        };
-        break;
-      }
-
-      // ── Isochrone (reachability zone) ─────────────────────────────────────
-      case "isochrone": {
-        const {
-          lat,
-          lon,
-          range = [1800],
-          range_type = "time",
-          profile = "driving-car",
-          interval,
-          smoothing = 0.25,
-        } = params as {
-          lat: number;
-          lon: number;
-          range?: number[];
-          range_type?: string;
-          profile?: string;
-          interval?: number;
-          smoothing?: number;
-        };
-
-        if (lat === undefined || lon === undefined) {
-          return errorResponse("lat and lon are required", 400);
-        }
-
-        url = `${baseUrl}/v2/isochrones/${profile}`;
-        fetchOptions = {
-          method: "POST",
-          headers: orsHeaders,
-          body: JSON.stringify({
-            locations: [[lon, lat]],
-            range,
-            range_type,
-            units: "km",
-            smoothing,
-            ...(interval !== undefined ? { interval } : {}),
-          }),
-        };
-        break;
-      }
-
-      // ── Distance / Duration Matrix ────────────────────────────────────────
-      case "matrix": {
-        const {
-          locations,
-          sources,
-          destinations: dests,
-          profile = "driving-car",
-          metrics = ["duration", "distance"],
-        } = params as {
-          locations: Coord[];
-          sources?: number[];
-          destinations?: number[];
-          profile?: string;
-          metrics?: string[];
-        };
-
-        if (!locations || !Array.isArray(locations) || locations.length < 2) {
-          return errorResponse(
-            "locations must be an array of at least 2 [lon, lat] pairs",
-            400,
-          );
-        }
-
-        url = `${baseUrl}/v2/matrix/${profile}/json`;
-        fetchOptions = {
-          method: "POST",
-          headers: orsHeaders,
-          body: JSON.stringify({
-            locations,
-            metrics,
-            units: "km",
-            ...(sources !== undefined ? { sources } : {}),
-            ...(dests !== undefined ? { destinations: dests } : {}),
-          }),
-        };
-        break;
-      }
-
-      // ── Optimization (TSP / VRP) ──────────────────────────────────────────
-      case "optimization": {
-        const { shipments, vehicles } = params as {
-          shipments: unknown[];
-          vehicles: unknown[];
-        };
-
-        if (!shipments || !vehicles) {
-          return errorResponse("shipments and vehicles are required", 400);
-        }
-
-        url = `${baseUrl}/optimization`;
-        fetchOptions = {
-          method: "POST",
-          headers: orsHeaders,
-          body: JSON.stringify({ shipments, vehicles }),
-        };
-        break;
-      }
-
-      // ── Forward Geocoding: text → coordinates ─────────────────────────────
-      case "geocode": {
-        const {
-          query,
-          size = 5,
-          countryCode,
-          focusLat,
-          focusLon,
-        } = params as {
-          query: string;
-          size?: number;
-          countryCode?: string;
-          focusLat?: number;
-          focusLon?: number;
-        };
-
-        if (!query || query.trim() === "") {
-          return errorResponse("query is required", 400);
-        }
-
-        url =
-          `${baseUrl}/geocode/search` +
-          `?api_key=${ORS_API_KEY}` +
-          `&text=${encodeURIComponent(query.trim())}` +
-          `&size=${size}`;
-
-        if (countryCode) url += `&boundary.country=${countryCode}`;
-        if (focusLat !== undefined && focusLon !== undefined) {
-          url += `&focus.point.lat=${focusLat}&focus.point.lon=${focusLon}`;
-        }
-        break;
-      }
-
-      // ── Structured Geocoding ──────────────────────────────────────────────
-      case "geocode-structured": {
-        const { address, city, county, state, country, postalCode } =
-          params as {
-            address?: string;
-            city?: string;
-            county?: string;
-            state?: string;
-            country?: string;
-            postalCode?: string;
-          };
-
-        const parts: string[] = [`api_key=${ORS_API_KEY}`];
-        if (address) parts.push(`address=${encodeURIComponent(address)}`);
-        if (city) parts.push(`locality=${encodeURIComponent(city)}`);
-        if (county) parts.push(`county=${encodeURIComponent(county)}`);
-        if (state) parts.push(`region=${encodeURIComponent(state)}`);
-        if (country) parts.push(`country=${encodeURIComponent(country)}`);
-        if (postalCode)
-          parts.push(`postalcode=${encodeURIComponent(postalCode)}`);
-
-        url = `${baseUrl}/geocode/search/structured?${parts.join("&")}`;
-        break;
-      }
-
-      // ── Reverse Geocoding: coordinates → address ──────────────────────────
-      case "reverse-geocode": {
-        const {
-          lat,
-          lon,
-          size = 1,
-        } = params as {
-          lat: number;
-          lon: number;
-          size?: number;
-        };
-
-        if (lat === undefined || lon === undefined) {
-          return errorResponse("lat and lon are required", 400);
-        }
-
-        url =
-          `${baseUrl}/geocode/reverse` +
-          `?api_key=${ORS_API_KEY}` +
-          `&point.lat=${lat}` +
-          `&point.lon=${lon}` +
-          `&size=${size}`;
-        break;
-      }
-
-      // ── Autocomplete ──────────────────────────────────────────────────────
-      case "autocomplete": {
-        const { query, focusLat, focusLon } = params as {
-          query: string;
-          focusLat?: number;
-          focusLon?: number;
-        };
-
-        if (!query || query.trim() === "") {
-          return errorResponse("query is required", 400);
-        }
-
-        url =
-          `${baseUrl}/geocode/autocomplete` +
-          `?api_key=${ORS_API_KEY}` +
-          `&text=${encodeURIComponent(query.trim())}`;
-
-        if (focusLat !== undefined && focusLon !== undefined) {
-          url += `&focus.point.lat=${focusLat}&focus.point.lon=${focusLon}`;
-        }
-        break;
-      }
-
-      // ── Elevation — single point ──────────────────────────────────────────
-      case "elevation-point": {
-        const { lat, lon } = params as { lat: number; lon: number };
-
-        if (lat === undefined || lon === undefined) {
-          return errorResponse("lat and lon are required", 400);
-        }
-
-        url =
-          `${baseUrl}/elevation/point` +
-          `?api_key=${ORS_API_KEY}` +
-          `&geometry={"type":"Point","coordinates":[${lon},${lat}]}`;
-        break;
-      }
-
-      // ── Elevation — line ──────────────────────────────────────────────────
-      case "elevation-line": {
-        const { coordinates } = params as { coordinates: unknown };
-
-        if (!coordinates) {
-          return errorResponse("coordinates are required", 400);
-        }
-
-        url = `${baseUrl}/elevation/line`;
-        fetchOptions = {
-          method: "POST",
-          headers: orsHeaders,
-          body: JSON.stringify({
-            format_in: "encodedpolyline5",
-            format_out: "encodedpolyline5",
-            geometry: coordinates,
-          }),
-        };
-        break;
-      }
-
-      // ── Unknown ───────────────────────────────────────────────────────────
-      default:
-        return errorResponse(
-          `Unknown action: "${action}". Supported: directions, directions-geojson, ` +
-            `isochrone, matrix, optimization, geocode, geocode-structured, ` +
-            `reverse-geocode, autocomplete, elevation-point, elevation-line`,
-          400,
-        );
-    }
-
-    // ── Execute the ORS request ───────────────────────────────────────────────
-
-    const isPost = fetchOptions.method === "POST";
-    const response = isPost
-      ? await fetch(url, fetchOptions)
-      : await fetch(url, { headers: { Accept: "application/json" } });
-
-    if (!response.ok) {
-      const text = await response.text();
-      console.error(`OpenRouteService error [${response.status}]:`, text);
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = { raw: text };
-      }
-
-      return errorResponse(
-        `OpenRouteService error [${response.status}]: ${JSON.stringify(parsed)}`,
-        response.status >= 500 ? 502 : response.status,
+    const HF_API_KEY = Deno.env.get("HF_API_KEY");
+    if (!HF_API_KEY) {
+      return new Response(
+        JSON.stringify({ error: "HF_API_KEY is not configured" }),
+        {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
       );
     }
 
-    const data = await response.json();
-    return jsonResponse(data);
+    const authHeader = req.headers.get("Authorization");
+    const body = await req.json();
+    const { messages } = body;
+
+    if (!messages || !Array.isArray(messages)) {
+      return new Response(
+        JSON.stringify({ error: "messages array is required" }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    // Build personalized context by loading user's profile and trips
+    let personalContext = "";
+
+    if (authHeader) {
+      try {
+        const supabaseUrl = Deno.env.get("SUPABASE_URL");
+        const supabaseKey = Deno.env.get("SUPABASE_ANON_KEY");
+        if (supabaseUrl && supabaseKey) {
+          const supabase = createClient(supabaseUrl, supabaseKey, {
+            global: { headers: { Authorization: authHeader } },
+          });
+
+          const {
+            data: { user },
+          } = await supabase.auth.getUser();
+
+          if (user) {
+            const [{ data: profile }, { data: trips }] = await Promise.all([
+              supabase.from("profiles").select("*").eq("id", user.id).single(),
+              supabase
+                .from("trips")
+                .select("*")
+                .order("start_date", { ascending: false })
+                .limit(10),
+            ]);
+
+            if (profile || trips) {
+              personalContext = "\n\n## Traveler Profile:\n";
+
+              if (profile) {
+                personalContext += `- Name: ${profile.name || "Unknown"}\n`;
+                if (
+                  profile.preferences &&
+                  Object.keys(profile.preferences).length > 0
+                ) {
+                  personalContext += `- Preferences: ${JSON.stringify(profile.preferences)}\n`;
+                }
+                if (
+                  profile.travel_personality &&
+                  Object.keys(profile.travel_personality).length > 0
+                ) {
+                  personalContext += `- Travel Personality: ${JSON.stringify(profile.travel_personality)}\n`;
+                }
+                if (
+                  profile.travel_history &&
+                  Array.isArray(profile.travel_history) &&
+                  profile.travel_history.length > 0
+                ) {
+                  personalContext += `- Travel History: ${JSON.stringify(profile.travel_history)}\n`;
+                }
+              }
+
+              if (trips && trips.length > 0) {
+                personalContext += `\n## Current Trips (${trips.length}):\n`;
+                for (const trip of trips) {
+                  const budgetStr = trip.budget_total
+                    ? `₹${Number(trip.budget_total).toLocaleString("en-IN")}`
+                    : "Not set";
+                  personalContext += `- "${trip.name}" → ${trip.destination}, ${trip.country || ""} | ${trip.start_date} to ${trip.end_date} | Budget: ${budgetStr} | Status: ${trip.status} | ID: ${trip.id}\n`;
+                }
+              }
+            }
+          }
+        }
+      } catch (profileError) {
+        console.error("Error loading profile context:", profileError);
+        // Continue without profile context — non-fatal
+      }
+    }
+
+    const fullSystemPrompt = BASE_SYSTEM_PROMPT + personalContext;
+
+    const hfResponse = await fetch(HF_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: HF_MODEL,
+        messages: [{ role: "system", content: fullSystemPrompt }, ...messages],
+        stream: true,
+        max_tokens: 1024,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!hfResponse.ok) {
+      const errorText = await hfResponse.text();
+      console.error("HuggingFace API error:", hfResponse.status, errorText);
+
+      if (hfResponse.status === 429) {
+        return new Response(
+          JSON.stringify({
+            error:
+              "AI rate limit exceeded. Please wait a moment and try again.",
+          }),
+          {
+            status: 429,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
+      if (hfResponse.status === 402) {
+        return new Response(
+          JSON.stringify({
+            error: "HuggingFace quota exceeded. Please check your plan.",
+          }),
+          {
+            status: 402,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
+      if (hfResponse.status === 401) {
+        return new Response(
+          JSON.stringify({
+            error: "HuggingFace API key is invalid or expired.",
+          }),
+          {
+            status: 401,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ error: `AI service error (${hfResponse.status})` }),
+        {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    // Stream the SSE response directly back to the client
+    return new Response(hfResponse.body, {
+      status: 200,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
   } catch (error: unknown) {
-    console.error("OpenRouteService function error:", error);
-    const message =
-      error instanceof Error ? error.message : "Internal server error";
-    return errorResponse(message, 500);
+    console.error("AI Chat error:", error);
+    const msg = error instanceof Error ? error.message : "Unknown error";
+    return new Response(JSON.stringify({ error: msg }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 });
